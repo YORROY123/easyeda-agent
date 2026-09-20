@@ -1246,6 +1246,39 @@ func AllActions() []ActionSpec {
 			Inputs:      []string{"fileName optional", "injectKeepout optional (default true)"},
 			Outputs:     []string{"artifact id", "file path", "file name", "size", "keepouts (injected count)"},
 		},
+		// ─── 制造资料导出 (Gerber / 坐标文件 / 3D) ───────────────────────────
+		// All read-only (Mutates stays false): the daemon's stale guard therefore
+		// treats them as PCB READS — they inherit an existing staleRisk advisory
+		// but never arm one, never trigger autosave, never invalidate a stage.
+		// The File travels back on the standard artifact path (inlineBase64 →
+		// .easyeda/artifacts/…), exactly like pcb.export.dsn / pcb.snapshot.
+		{
+			Name:        "pcb.export.gerber",
+			Domain:      DomainPcb,
+			Phase:       2,
+			NeedsWindow: true,
+			Description: "Export the active PCB's Gerber set as a ZIP artifact (eda.pcb_ManufactureData.getGerberFile, @beta). Read-only — the typed replacement for the `debug exec` workaround. The ZIP holds the per-layer Gerbers (GTL/GBL/silk/mask/paste), Gerber_BoardOutlineLayer.GKO and the drill files (Drill_PTH_Through.DRL / Drill_NPTH_Through.DRL / …); `easyeda pcb export-gerber` lists the entries after saving so layers+drills can be sanity-checked without a viewer. Layers/objects stay at the platform (JLCPCB production) default. unit accepts mm|inch ONLY — mil is the pick-and-place unit set. Refuses when the active document is provably not a PCB; returns EDA_CALL_FAILED naming the API when the platform answers undefined (empty board / no outline / cancelled job).",
+			Inputs:      []string{"fileName optional (default Gerber)", "colorSilkscreen optional (嘉立创彩色丝印)", "unit optional (mm|inch)", "digitalFormat optional ({integerNumber,decimalNumber})"},
+			Outputs:     []string{"artifact id", "file path", "file name", "size", "mimeType", "unit", "colorSilkscreen", "digitalFormat"},
+		},
+		{
+			Name:        "pcb.export.pick_and_place",
+			Domain:      DomainPcb,
+			Phase:       2,
+			NeedsWindow: true,
+			Description: "Export the active PCB's pick-and-place / 坐标文件 (eda.pcb_ManufactureData.getPickAndPlaceFile, @beta). Read-only. fileType csv|xlsx (default csv); unit accepts mm|mil ONLY — inch is the Gerber unit set. ⚠ Observed on EasyEDA Pro desktop 3.2.149: the 'csv' export is actually UTF-16 TAB-separated — decode UTF-16 and split on TAB, do not parse it as UTF-8 comma CSV; the result repeats this as encodingCaveat. Returns EDA_CALL_FAILED naming the API when the platform answers undefined (usually: no components placed yet — run pcb.import_changes first).",
+			Inputs:      []string{"fileName optional (default PickAndPlace)", "fileType optional (csv|xlsx, default csv)", "unit optional (mm|mil)"},
+			Outputs:     []string{"artifact id", "file path", "file name", "fileType", "size", "mimeType", "unit", "encodingCaveat"},
+		},
+		{
+			Name:        "pcb.export.model3d",
+			Domain:      DomainPcb,
+			Phase:       2,
+			NeedsWindow: true,
+			Description: "Export the active PCB as a 3D model file (eda.pcb_ManufactureData.get3DFile, @beta). Read-only. fileType step|obj (default step); modelMode Outfit (装配体) | Parts (零件); element drawn from 'Component Model' | 'Via' | 'Silkscreen' | 'Wire In Signal Layer'; autoGenerateModels builds a box from each unmodelled part's 高度 property. Upstream caveat passed through: only components whose model was imported AS STEP appear in a STEP export. Returns EDA_CALL_FAILED naming the API when the platform answers undefined.",
+			Inputs:      []string{"fileName optional (default Model3D)", "fileType optional (step|obj, default step)", "element optional (string[])", "modelMode optional (Outfit|Parts)", "autoGenerateModels optional"},
+			Outputs:     []string{"artifact id", "file path", "file name", "fileType", "size", "mimeType", "modelMode", "element", "autoGenerateModels"},
+		},
 		{
 			Name:        "pcb.import_autoroute",
 			Domain:      DomainPcb,

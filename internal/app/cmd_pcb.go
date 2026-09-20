@@ -2286,6 +2286,12 @@ external router (Freerouting) would route under the antenna. The result reports
 		c.Flags().StringVar(&previousSha, "previous-sha256", "", "sha256 of the previous snapshot; enables stale-frame detection + auto-retry")
 		pcb.AddCommand(c)
 	}
+	// ── 制造资料导出 (P10 交付): Gerber / 坐标文件 / 3D ─────────────────────
+	// Typed replacements for the `debug exec eda.pcb_ManufactureData.*` workaround.
+	// Read-only; the File rides the standard artifact path into .easyeda/artifacts/.
+	pcb.AddCommand(newPcbExportGerberCmd(cfg, &window, stdout, stderr))
+	pcb.AddCommand(newPcbExportPnpCmd(cfg, &window, stdout, stderr))
+	pcb.AddCommand(newPcbExport3DCmd(cfg, &window, stdout, stderr))
 	// ── stage-snapshot: recording/demo stage capture (snapshot + data bundle) ──
 	pcb.AddCommand(newPcbSyncDesignatorsCmd(cfg, &window, stdout, stderr))
 	pcb.AddCommand(newPcbStageSnapshotCmd(cfg, &window, stdout, stderr))

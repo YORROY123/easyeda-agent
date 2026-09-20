@@ -9717,6 +9717,286 @@ const pcbExportDsn: Handler = async (payload) => {
 	return { result: { artifactId: artifact.id, fileName: file.name || fileName, size: outFile.size, keepouts }, artifacts: [artifact] };
 };
 
+// ─── Manufacturing exports (Gerber / 坐标文件 / 3D) ────────────────────
+//
+// `eda.pcb_ManufactureData.*` hands back a browser `File`. It reaches the daemon
+// through EXACTLY the same artifact path as `pcb.export.dsn`, `pcb.snapshot`,
+// `schematic.export.bom` and `schematic.export.image`: blobToArtifact →
+// inlineBase64 on the response → the daemon decodes it under
+// `.easyeda/artifacts/` and fills `artifacts[].path`. No new transport.
+//
+// All three are READ-ONLY: they are catalogued `Mutates:false`, so the daemon's
+// stale guard treats them as PCB READS (they inherit an existing `staleRisk`
+// advisory but never arm one), autosave never fires for them, and they never
+// invalidate a stage.
+//
+// Every one of these APIs is `@beta` upstream and may answer `undefined` instead
+// of throwing (an empty board, a cancelled host-side job, a build that does not
+// implement it). That is reported as a typed EDA_CALL_FAILED naming the API —
+// never as a silent empty artifact.
+
+/**
+ * Refuse a PCB-only export when the ACTIVE document is provably NOT a PCB.
+ *
+ * Fail-OPEN by design: when the document probe throws, or the host reports no
+ * type at all, we proceed. The host can render a perfectly live PCB while every
+ * DMT metadata lookup comes back empty (AGENTS.md #190/#200), so an unreadable
+ * probe must not become a refusal — only a type we positively read and that is
+ * positively something else does.
+ *
+ * Zero bytes are written before this check, hence PRECONDITION_REFUSED
+ * (a caller-input problem that must not count against connector write health).
+ *
+ * @param action - the action name, for the message
+ * @param what - human label of the export, for the message
+ */
+async function requireActivePcbDocument(action: string, what: string): Promise<void> {
+	let label: string | undefined;
+	try {
+		const doc = await eda.dmt_SelectControl.getCurrentDocumentInfo();
+		label = documentTypeLabel(doc?.documentType);
+	}
+	catch {
+		return; // unreadable identity proves nothing — see the fail-open note above
+	}
+	if (label === undefined || label === 'pcb') {
+		return;
+	}
+	throw new ActionError(
+		ErrorCodes.PRECONDITION_REFUSED,
+		`${action} exports ${what} from the ACTIVE PCB, but the active document is "${label}". `
+		+ 'Switch to the PCB first (`easyeda doc switch <pcb-name|uuid>`). Nothing was exported.',
+	);
+}
+
+/**
+ * Read an optional enum-ish string field, refusing anything outside `allowed`.
+ *
+ * A bad enum is a caller-input problem caught before any `eda.*` call, so it
+ * raises PRECONDITION_REFUSED (zero mutation) rather than EDA_CALL_FAILED.
+ *
+ * @param payload - request payload
+ * @param field - field name
+ * @param allowed - the accepted lowercase values
+ * @returns the value (lowercased) or undefined when absent
+ */
+function optionalEnum<T extends string>(
+	payload: Payload,
+	field: string,
+	allowed: ReadonlyArray<T>,
+): T | undefined {
+	const raw = optionalString(payload, field);
+	if (raw === undefined || raw === '') {
+		return undefined;
+	}
+	const value = raw.toLowerCase() as T;
+	if (!allowed.includes(value)) {
+		throw new ActionError(
+			ErrorCodes.PRECONDITION_REFUSED,
+			`${field} must be one of ${allowed.join(' | ')} (got "${raw}").`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Validate the optional Gerber coordinate `digitalFormat` ({integerNumber,
+ * decimalNumber}). Both must be positive integers; anything else is refused
+ * before the export runs.
+ *
+ * @param payload - request payload
+ * @returns the format object, or undefined when the caller omitted it
+ */
+function optionalDigitalFormat(payload: Payload): { integerNumber: number; decimalNumber: number } | undefined {
+	const raw = payload.digitalFormat;
+	if (raw === undefined || raw === null) {
+		return undefined;
+	}
+	const source = raw as Partial<{ integerNumber: unknown; decimalNumber: unknown }>;
+	const ok = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
+	if (!ok(source.integerNumber) || !ok(source.decimalNumber)) {
+		throw new ActionError(
+			ErrorCodes.PRECONDITION_REFUSED,
+			'digitalFormat must be {integerNumber, decimalNumber} with positive integers (e.g. {integerNumber:2, decimalNumber:6}).',
+		);
+	}
+	return { integerNumber: source.integerNumber, decimalNumber: source.decimalNumber };
+}
+
+/**
+ * Export the active PCB's Gerber set (`eda.pcb_ManufactureData.getGerberFile`).
+ * Read-only. The returned File is a ZIP holding the per-layer Gerbers, the board
+ * outline and the drill files; the CLI lists its entries after saving so an
+ * Agent can sanity-check layers/drills without a viewer.
+ *
+ * Layers/objects are left at the platform default (the JLCPCB production set) —
+ * we do not second-guess the fab's own default layer selection.
+ */
+const pcbExportGerber: Handler = async (payload) => {
+	await requireActivePcbDocument('pcb.export.gerber', 'the Gerber set');
+	const fileName = optionalString(payload, 'fileName') ?? 'Gerber';
+	const colorSilkscreen = optionalBoolean(payload, 'colorSilkscreen');
+	// getGerberFile accepts only MILLIMETER | INCH (NOT mil — that is the
+	// pick-and-place unit set). Enforced here so a wrong unit is a typed refusal.
+	const unit = optionalEnum(payload, 'unit', ['mm', 'inch'] as const);
+	const digitalFormat = optionalDigitalFormat(payload);
+	let file: File | undefined;
+	try {
+		file = await eda.pcb_ManufactureData.getGerberFile(
+			fileName,
+			colorSilkscreen,
+			unit as (ESYS_Unit.MILLIMETER | ESYS_Unit.INCH | undefined),
+			digitalFormat,
+		);
+	}
+	catch (err) {
+		throw edaError(err, 'Failed to export Gerber.');
+	}
+	if (!file) {
+		throw new ActionError(
+			ErrorCodes.EDA_CALL_FAILED,
+			'Gerber export returned no file — eda.pcb_ManufactureData.getGerberFile (@beta) answered undefined. '
+			+ 'Usual causes: the PCB is empty / has no board outline, or the host cancelled the job. '
+			+ 'Check `easyeda pcb outline-get` and retry with the PCB window in the FOREGROUND.',
+		);
+	}
+	const outName = file.name || `${fileName}.zip`;
+	const artifact = await blobToArtifact(file, 'pcb_gerber', outName, 'application/zip');
+	return {
+		result: {
+			artifactId: artifact.id,
+			fileName: outName,
+			size: file.size,
+			mimeType: artifact.mimeType,
+			unit: unit ?? null,
+			colorSilkscreen: colorSilkscreen ?? null,
+			digitalFormat: digitalFormat ?? null,
+		},
+		artifacts: [artifact],
+	};
+};
+
+/**
+ * Export the active PCB's pick-and-place / 坐标文件
+ * (`eda.pcb_ManufactureData.getPickAndPlaceFile`). Read-only.
+ *
+ * ⚠️ Observed on EasyEDA Pro desktop 3.2.149: `fileType:'csv'` yields a
+ * **UTF-16 TAB-separated** file despite the name. Consumers must decode UTF-16
+ * and split on TAB, not read it as UTF-8 comma CSV. Reported as
+ * `encodingCaveat` on the result so a caller does not have to remember.
+ */
+const pcbExportPickAndPlace: Handler = async (payload) => {
+	await requireActivePcbDocument('pcb.export.pick_and_place', 'the pick-and-place (坐标) file');
+	const fileType = optionalEnum(payload, 'fileType', ['csv', 'xlsx'] as const) ?? 'csv';
+	const fileName = optionalString(payload, 'fileName') ?? 'PickAndPlace';
+	// getPickAndPlaceFile accepts only MILLIMETER | MIL (NOT inch).
+	const unit = optionalEnum(payload, 'unit', ['mm', 'mil'] as const);
+	let file: File | undefined;
+	try {
+		file = await eda.pcb_ManufactureData.getPickAndPlaceFile(
+			fileName,
+			fileType,
+			unit as (ESYS_Unit.MILLIMETER | ESYS_Unit.MIL | undefined),
+		);
+	}
+	catch (err) {
+		throw edaError(err, 'Failed to export the pick-and-place file.');
+	}
+	if (!file) {
+		throw new ActionError(
+			ErrorCodes.EDA_CALL_FAILED,
+			'Pick-and-place export returned no file — eda.pcb_ManufactureData.getPickAndPlaceFile (@beta) answered undefined. '
+			+ 'Usual cause: the PCB has no placed components yet (run `easyeda pcb import-changes` first).',
+		);
+	}
+	const outName = file.name || `${fileName}.${fileType}`;
+	const fallbackMime = fileType === 'xlsx'
+		? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+		: 'text/csv';
+	const artifact = await blobToArtifact(file, 'pcb_pick_and_place', outName, fallbackMime);
+	return {
+		result: {
+			artifactId: artifact.id,
+			fileName: outName,
+			fileType,
+			size: file.size,
+			mimeType: artifact.mimeType,
+			unit: unit ?? null,
+			encodingCaveat: fileType === 'csv'
+				? 'observed on 3.2.149: the "csv" export is UTF-16 TAB-separated — decode UTF-16 and split on TAB'
+				: null,
+		},
+		artifacts: [artifact],
+	};
+};
+
+/**
+ * Export the active PCB's 3D model (`eda.pcb_ManufactureData.get3DFile`).
+ * Read-only. `@beta` upstream — and only components whose model was imported as
+ * STEP appear in a STEP export (documented upstream caveat, passed through).
+ */
+const pcbExportModel3D: Handler = async (payload) => {
+	await requireActivePcbDocument('pcb.export.model3d', 'the 3D model');
+	const fileType = optionalEnum(payload, 'fileType', ['step', 'obj'] as const) ?? 'step';
+	const fileName = optionalString(payload, 'fileName') ?? 'Model3D';
+	const modelMode = optionalString(payload, 'modelMode');
+	if (modelMode !== undefined && modelMode !== 'Outfit' && modelMode !== 'Parts') {
+		throw new ActionError(
+			ErrorCodes.PRECONDITION_REFUSED,
+			`modelMode must be Outfit (装配体) or Parts (零件) — got "${modelMode}".`,
+		);
+	}
+	const allowedElements = ['Component Model', 'Via', 'Silkscreen', 'Wire In Signal Layer'] as const;
+	type Element3D = typeof allowedElements[number];
+	let element: Array<Element3D> | undefined;
+	const rawElement = payload.element;
+	if (rawElement !== undefined && rawElement !== null) {
+		if (!Array.isArray(rawElement) || rawElement.some(v => !allowedElements.includes(v as Element3D))) {
+			throw new ActionError(
+				ErrorCodes.PRECONDITION_REFUSED,
+				`element must be an array drawn from ${allowedElements.join(' | ')}.`,
+			);
+		}
+		element = rawElement as Array<Element3D>;
+	}
+	const autoGenerateModels = optionalBoolean(payload, 'autoGenerateModels');
+	let file: File | undefined;
+	try {
+		file = await eda.pcb_ManufactureData.get3DFile(
+			fileName,
+			fileType,
+			element,
+			modelMode,
+			autoGenerateModels,
+		);
+	}
+	catch (err) {
+		throw edaError(err, 'Failed to export the 3D model.');
+	}
+	if (!file) {
+		throw new ActionError(
+			ErrorCodes.EDA_CALL_FAILED,
+			'3D export returned no file — eda.pcb_ManufactureData.get3DFile (@beta) answered undefined. '
+			+ 'Usual causes: no component carries a 3D model (try autoGenerateModels=true), or this build does not implement the @beta API.',
+		);
+	}
+	const outName = file.name || `${fileName}.${fileType}`;
+	const artifact = await blobToArtifact(file, 'pcb_model3d', outName, 'application/octet-stream');
+	return {
+		result: {
+			artifactId: artifact.id,
+			fileName: outName,
+			fileType,
+			size: file.size,
+			mimeType: artifact.mimeType,
+			modelMode: modelMode ?? null,
+			element: element ?? null,
+			autoGenerateModels: autoGenerateModels ?? null,
+		},
+		artifacts: [artifact],
+	};
+};
+
 /**
  * Import a routed-result file from the autorouter. `format: 'ses'` (Specctra
  * Session, default) or `'json'` (EasyEDA autoroute JSON). The file arrives as
@@ -12877,6 +13157,9 @@ const HANDLERS: Record<string, Handler> = {
 	'pcb.fill.delete': pcbFillDelete,
 	'pcb.save': pcbSave,
 	'pcb.export.dsn': pcbExportDsn,
+	'pcb.export.gerber': pcbExportGerber,
+	'pcb.export.pick_and_place': pcbExportPickAndPlace,
+	'pcb.export.model3d': pcbExportModel3D,
 	'pcb.import_autoroute': pcbImportAutoroute,
 	'pcb.snapshot': pcbSnapshot,
 	'pcb.outline.set': pcbOutlineSet,

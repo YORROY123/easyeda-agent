@@ -13,7 +13,7 @@ missing **and** the user explicitly accepts a debug path.
 
 > **本文导航**:块的 PCB 约束(先查)· 坐标系与模型 · Workflow · Actions(Navigation / Board /
 > View / Read·inspect / Routing / Copper pour / Keep-out regions / Filled region / Sch→PCB sync /
-> Layout adjust)· Board outline(板框)· Auto-layout · Guardrails。
+> Layout adjust / **制造资料导出**)· Board outline(板框)· Auto-layout · Guardrails。
 
 ## 块的 PCB 约束(先查)
 
@@ -122,6 +122,45 @@ Act on the focused canvas; the editor view shortcuts. CLI: `easyeda view …`.
 
 **已移至 [`pcb-layout.md`](pcb-layout.md)** —— 本节内容整体搬出，减少每次调用的上下文成本（RFC #178）。需要时读那个文件。
 
+### 制造资料导出（交付 / P10 之后）
+
+`eda.pcb_ManufactureData.*` 的 typed 封装，**全部只读**：不改画布、不触发 autosave、
+不给后续读取打脏标记，但和其他 PCB 读一样会继承已有的 `staleRisk` 提示。
+文件走既有 artifact 通道落到 `.easyeda/artifacts/`，路径见 `artifacts[].path`
+或 stderr 的 `📎 artifact saved:` 行；`--out <path>` 可再存一份到指定位置。
+输出约定同 `pcb check`：默认人类可读摘要，`--json` 出 `{ok,result}` 信封。
+
+- `easyeda pcb export-gerber`（`pcb.export.gerber`）— **Gerber 制版文件**，产物是 ZIP。
+  `--name` 文件名、`--unit mm|inch`（**没有 mil**，那是坐标文件那组的单位）、
+  `--digits 2.6` 坐标数字格式（整数位.小数位）、`--color-silkscreen` 嘉立创彩色丝印。
+  导出后命令用纯 Go 解析 ZIP 目录，**列出全部条目**（文件名 / 分类 / 解压后字节数）并按
+  copper / silkscreen / soldermask / paste / outline / drill / report 分类计数——
+  不开 CAM viewer 就能核对层和钻孔是否齐全；**缺铜层 / 缺钻孔 / 缺板框会单独告警**。
+  3.2.149 实测 ZIP 内含 `Gerber_TopLayer.GTL`、`Gerber_BottomLayer.GBL`、丝印/阻焊/锡膏、
+  `Gerber_BoardOutlineLayer.GKO`、`Drill_PTH_Through.DRL`、`Drill_NPTH_Through.DRL`、
+  `Drill_PTH_Through_Via.DRL`、`FlyingProbeTesting.json`。
+  导出层与对象保持平台（嘉立创生产）默认，本命令不替 fab 改选层。
+- `easyeda pcb export-pnp`（`pcb.export.pick_and_place`）— **坐标文件 / 贴片位置文件**。
+  `--type csv|xlsx`（默认 csv）、`--unit mm|mil`（**没有 inch**）、`--name`。
+  ⚠️ **3.2.149 实测：`--type csv` 拿到的其实是 UTF-16 编码、TAB 分隔的文本**，
+  名字叫 csv 而已。下游必须按 UTF-16 解码 + 按 TAB 切分，不能当 UTF-8 逗号 CSV 读；
+  响应里的 `encodingCaveat` 会重复这条。要确定性表格就用 `--type xlsx`。
+- `easyeda pcb export-3d`（`pcb.export.model3d`）— **3D 模型**，`--type step|obj`、
+  `--mode Outfit|Parts`（装配体 / 零件）、`--elements "Component Model,Via,Silkscreen,Wire In Signal Layer"`、
+  `--auto-generate`（未绑模型的元件按"高度"属性生成方块）。
+  上游限制原样转达：**只有以 STEP 格式导入的元件模型**才会出现在 STEP 导出里。
+
+三个接口上游都标 `@beta`，可能**不抛异常而直接返回 `undefined`**（空板 / 无板框 /
+没有元件 / 该构建未实现）。这时返回的是点名该 API 的 typed 错误（`EDA_CALL_FAILED`），
+不会给你一个空文件冒充成功。活动文档若**确凿不是 PCB**，动手前就以
+`PRECONDITION_REFUSED` 拒绝（一个字节都没导）；文档身份读不出来时放行——
+宿主可能画布是活 PCB 而元数据全空（#190/#200），读不出不构成拒绝理由。
+
+> **验证边界（诚实记录）**:上述 ZIP 条目与 "csv 实为 UTF-16 TSV" 来自 Windows 11 +
+> EasyEDA Pro 桌面版 3.2.149 国际版上用 `debug exec` 裸调同名 API 的实测；
+> **typed action / CLI 本身尚未在新构建上连编辑器实跑过**，只过了离线单元测试。
+> `get3DFile` 的返回形态一次都没实测过。首次实跑请回读 `artifacts[].path` 与条目清单。
+
 ## PCB mutation 后的读取与 `staleRisk`
 
 改完铜再读,读到的是**旧引擎状态**:每个 PCB 文档有自己的枚举缓存,
@@ -151,7 +190,9 @@ daemon 不再拒绝这种读取，而是在响应和 CLI stderr 中附加非阻�
 - 每个稳定检查点显式保存并验证 `saved:true`；用户明确要求逐步确认时再按其节奏暂停。
 - Do not claim completion after a mutation until readback / DRC verifies it (or state the remaining risk).
 - No undo — record before/after into the audit log so a move can be reversed by re-applying the old coordinates.
-- Treat `File`/`Blob` outputs (gerber/pick-and-place/3D) as artifacts.
+- Treat `File`/`Blob` outputs (gerber/pick-and-place/3D) as artifacts —— 走
+  `pcb export-gerber` / `export-pnp` / `export-3d` 这三条 typed 命令，**不要再用
+  `debug exec` 裸调 `eda.pcb_ManufactureData.*`**（见上「制造资料导出」）。
 
 ### Windows PowerShell JSON 补丁（#192）
 

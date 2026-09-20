@@ -168,6 +168,29 @@ EasyEDA 交互界面兜底。能力边界与未来 typed 验收见 [project-impo
 - `pcb.view.side` — 切到顶面/底面视图（选该面铜层为当前层 + 聚焦该面铜+丝印），随后 `pcb snapshot` 即反映该面。注意：EasyEDA 无原生画布翻面 API，这是「层聚焦」近似而非物理翻板 → `easyeda pcb view-side --side bottom`
 - `pcb.nets.list` — PCB 全部网络
 
+### 制造资料导出（只读，产物是 artifact）
+
+三条 typed action 封装 `eda.pcb_ManufactureData.*`（均 `@beta`），替掉此前只能走
+`debug exec` 的做法。都不改画布、不触发 autosave、不打脏标记；文件走既有 artifact 通道
+落到 `.easyeda/artifacts/`，路径取 `artifacts[].path`。CLI 默认人类可读摘要，`--json` 出
+`{ok,result}` 信封，`--out` 另存一份到指定路径。
+
+- `pcb.export.gerber` — Gerber 制版文件（ZIP）。`unit` 只接受 **mm|inch**；另有
+  `colorSilkscreen`、`digitalFormat{integerNumber,decimalNumber}`。导出层/对象保持平台默认。
+  → `easyeda pcb export-gerber [--name N] [--unit mm|inch] [--digits 2.6] [--color-silkscreen]`，
+  保存后**列出 ZIP 全部条目并按铜层/丝印/阻焊/锡膏/板框/钻孔分类计数**；缺铜层、缺钻孔或缺板框单独告警。
+- `pcb.export.pick_and_place` — 坐标文件。`fileType` csv|xlsx（默认 csv），`unit` 只接受 **mm|mil**。
+  ⚠️ 3.2.149 实测 csv 实为 **UTF-16 + TAB 分隔**，须按 UTF-16 解码并按 TAB 切分；结果里的
+  `encodingCaveat` 会重复这条。→ `easyeda pcb export-pnp [--type csv|xlsx] [--unit mm|mil]`
+- `pcb.export.model3d` — 3D 模型。`fileType` step|obj，`modelMode` Outfit|Parts，
+  `element` 取自 `Component Model|Via|Silkscreen|Wire In Signal Layer`，`autoGenerateModels`。
+  上游限制：只有以 STEP 导入的元件模型会出现在 STEP 导出里。→ `easyeda pcb export-3d`
+
+平台可能**不抛错而直接返回 `undefined`**（空板 / 无板框 / 无元件 / 该构建未实现）——
+这时得到点名该 API 的 `EDA_CALL_FAILED`，不会有空文件冒充成功。活动文档确凿不是 PCB 时
+以 `PRECONDITION_REFUSED` 零写入拒绝；文档身份读不出来则放行（读不出不等于不是 PCB）。
+能力边界与实测证据见 [pcb.md](pcb.md)。
+
 ### 长度约束：差分对 / 等长网络组（#176）
 
 **布线前（P7 之前）声明,布线后用 `pcb report` 量。** 约束是让 DRC 与布线器知道「这两条是一对 /
